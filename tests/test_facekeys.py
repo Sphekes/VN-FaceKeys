@@ -216,6 +216,30 @@ class TestState(unittest.TestCase):
         self.assertEqual(self.call('/action/macro')[1]['status'],'paused')
         self.assertEqual(self.backend.events,[('scroll',1)])
 
+    def test_resume_does_not_continue_cancelled_macro(self):
+        self.cfg['mappings']['macro'] = {
+            'type': 'sequence',
+            'cooldown_ms': 0,
+            'steps': [{'type': 'scroll', 'steps': 1}, {'type': 'scroll', 'steps': -1}],
+        }
+        self.write()
+        scroll = self.backend.scroll
+        for pause_route, resume_route in (('/pause', '/resume'), ('/toggle', '/toggle')):
+            with self.subTest(pause_route=pause_route):
+                self.backend.events.clear()
+
+                def pause_then_resume(steps):
+                    scroll(steps)
+                    self.backend.scroll = scroll
+                    self.assertEqual(self.call(pause_route), (200, {'status': 'ok', 'paused': True}))
+                    self.assertEqual(self.call(resume_route), (200, {'status': 'ok', 'paused': False}))
+
+                self.backend.scroll = pause_then_resume
+                self.assertEqual(self.call('/action/macro'), (202, {'status': 'paused'}))
+                self.assertEqual(self.backend.events, [('scroll', 1)])
+                self.assertEqual(self.call('/action/macro'), (204, None))
+                self.assertEqual(self.backend.events, [('scroll', 1), ('scroll', 1), ('scroll', -1)])
+
     def test_sendinput_failure_not_success(self):
         self.backend.scroll=lambda _: (_ for _ in ()).throw(OSError('failed'))
         with self.assertLogs(f.LOG,level='ERROR'):
@@ -229,7 +253,10 @@ class TestState(unittest.TestCase):
                 conn=http.client.HTTPConnection('127.0.0.1',server.server_port,timeout=3)
                 try:
                     conn.request(method,path,body,headers or {})
-                    r=conn.getresponse(); return r.status,r.read()
+                    response = conn.getresponse()
+                    if response.status == 204:
+                        self.assertIsNone(response.getheader('Content-Length'))
+                    return response.status, response.read()
                 finally: conn.close()
             def raw_req(data):
                 with socket.create_connection(('127.0.0.1', server.server_port), timeout=3) as conn:

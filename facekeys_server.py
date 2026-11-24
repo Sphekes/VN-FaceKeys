@@ -313,8 +313,15 @@ class State:
         self.lock = threading.Lock()
         self.input_lock = threading.Lock()
         self.paused = False
+        self.pause_generation = 0
         self.last_fire = {}
         self.last_global = float("-inf")
+
+    def set_paused(self, paused):
+        # The caller holds self.lock. Resuming never restores a cancelled action.
+        self.paused = paused
+        if paused:
+            self.pause_generation += 1
 
     def response(self, method, path, token):
         # Config + state changes are serialized, but never hold the state lock during a macro.
@@ -330,7 +337,7 @@ class State:
             if method == "GET" and path == "/status":
                 return 200, {"status": "ok", "paused": self.paused, "dry_run": self.dry_run, "busy": self.input_lock.locked()}
             if method == "POST" and path in ("/pause", "/resume", "/toggle"):
-                self.paused = not self.paused if path == "/toggle" else path == "/pause"
+                self.set_paused(not self.paused if path == "/toggle" else path == "/pause")
                 LOG.info("[控制] paused=%s", self.paused)
                 return 200, {"status": "ok", "paused": self.paused}
             match = re.fullmatch(r"/action/([a-zA-Z0-9_-]{1,40})", path) if method == "POST" else None
@@ -359,9 +366,10 @@ class State:
                 return skip("global_cooldown")
             if not self.input_lock.acquire(blocking=False):
                 return skip("busy")  # no stale queued clicks
+            pause_generation = self.pause_generation
         def guard():
             with self.lock:
-                if self.paused:
+                if self.pause_generation != pause_generation:
                     raise Blocked("paused")
             if cfg["restrict_foreground"]:
                 process = self.backend.foreground() if self.backend is not None else None
@@ -427,7 +435,8 @@ class Handler(BaseHTTPRequestHandler):
         body = b"" if obj is None else json.dumps(obj).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
+        if code != 204:
+            self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "close")
         self.end_headers()
@@ -531,14 +540,14 @@ def main(argv=None, background=False):
             state = State(store, backend, args.dry_run)
             with Server((cfg["listen"], cfg["port"]), state) as server:
                 LOG.info("VN FaceKeys %s 已启动，监听 %s:%s，dry_run=%s", VERSION, *server.server_address, args.dry_run)
-                LOG.info("配置：%s；仅限可信网络", path)
+                LOG.info("配置：%s", path)
                 try:
                     server.serve_forever(poll_interval=0.25)
                 except KeyboardInterrupt:
                     pass
                 finally:
                     with state.lock:
-                        state.paused = True
+                        state.set_paused(True)
             LOG.info("VN FaceKeys 已停止")
         return 0
     except Exception:
