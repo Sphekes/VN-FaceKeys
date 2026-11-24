@@ -5,6 +5,7 @@ import io
 import json
 import logging
 from pathlib import Path
+import socket
 import tempfile
 import threading
 import unittest
@@ -230,20 +231,88 @@ class TestState(unittest.TestCase):
                     conn.request(method,path,body,headers or {})
                     r=conn.getresponse(); return r.status,r.read()
                 finally: conn.close()
+            def raw_req(data):
+                with socket.create_connection(('127.0.0.1', server.server_port), timeout=3) as conn:
+                    conn.sendall(data)
+                    conn.shutdown(socket.SHUT_WR)
+                    with http.client.HTTPResponse(conn) as response:
+                        response.begin()
+                        status, body = response.status, response.read()
+                    self.assertEqual(conn.recv(1), b'')
+                    return status, body
             try:
                 h={'X-Api-Key':self.cfg['token']}
-                self.assertEqual(req('GET','/health')[0],403)
                 self.assertEqual(req('GET','/health',h)[0],200)
                 self.assertEqual(req('POST','/action/mouth',h,b'{}'),(204,b''))
-                self.assertEqual(req('POST','/action/blink',h,b'x'*4097)[0],413)
-                self.assertEqual(req('POST','/action/blink',{**h,'Transfer-Encoding':'chunked'})[0],400)
                 self.assertEqual(req('POST','/pause',h)[0],200)
                 self.assertEqual(req('POST','/action/blink',h)[0],202)
+
+                rejections = (
+                    ('GET', '/health', {'X-Api-Key': 'private-key'}, None, 403, 'forbidden'),
+                    ('GET', '/private-path', h, None, 404, 'not_found'),
+                    ('POST', '/' + 'x' * 128, h, None, 400, 'path_too_long'),
+                    ('POST', '/action/blink', {**h, 'Transfer-Encoding': 'private-encoding'},
+                     None, 400, 'unsupported_transfer_encoding'),
+                    ('POST', '/action/blink', {**h, 'Content-Length': 'private-length'},
+                     None, 400, 'invalid_length'),
+                    ('POST', '/action/blink', h, b'x' * 4097, 413, 'body_too_large'),
+                    ('OPTIONS', '/private-path', h, None, 501, 'unsupported_method'),
+                    ('PRIVATE-METHOD', '/private-path', h, None, 501, 'unsupported_method'),
+                )
+                for method, path, headers, body, code, reason in rejections:
+                    with self.subTest(method=method, reason=reason):
+                        with self.assertLogs(f.LOG, level='WARNING') as logs:
+                            self.assertEqual(req(method, path, headers, body)[0], code)
+                        self.assertEqual(len(logs.records), 1)
+                        message = logs.records[0].getMessage()
+                        logged_method = '-' if method == 'PRIVATE-METHOD' else method
+                        self.assertIn(f'来源=127.0.0.1 方法={logged_method} 状态={code} 原因={reason}', message)
+                        self.assertNotIn('private-', message.lower())
+                        self.assertNotIn(self.cfg['token'], message)
+
+                with self.assertLogs(f.LOG, level='WARNING') as logs:
+                    code, _ = raw_req(b'GET /private-path HTTP/1.0 extra HTTP/1.0\r\n\r\n')
+                    self.assertEqual(code, 400)
+                self.assertEqual(len(logs.records), 1)
+                self.assertIn('状态=400 原因=http_parse_error', logs.output[0])
+                self.assertNotIn('private-path', logs.output[0])
+
+                with self.assertLogs(f.LOG, level='DEBUG') as logs:
+                    code, _ = raw_req(b'POST /action/blink HTTP/1.0\r\nContent-Length: 2\r\n\r\nx')
+                    self.assertEqual(code, 400)
+                self.assertEqual(
+                    [(record.levelno, record.getMessage()) for record in logs.records],
+                    [(logging.DEBUG, '[HTTP] 127.0.0.1 POST 400 incomplete_body')],
+                )
             finally:
                 server.shutdown(); t.join(3)
 
 
 class TestLogging(unittest.TestCase):
+    def test_overload_warnings_report_dropped_connections(self):
+        with (
+            f.Server(('127.0.0.1', 0), None) as server,
+            patch.object(server, 'shutdown_request') as close,
+            patch.object(f.time, 'monotonic', return_value=100) as clock,
+        ):
+            for _ in range(f.MAX_CONNECTIONS):
+                self.assertTrue(server.slots.acquire(blocking=False))
+
+            with self.assertLogs(f.LOG, level='WARNING') as logs:
+                server.process_request(object(), ('127.0.0.1', 10001))
+                server.service_actions()
+            self.assertIn('丢弃连接数=1 最近来源=127.0.0.1', logs.output[0])
+
+            with self.assertNoLogs(f.LOG, level='WARNING'):
+                server.process_request(object(), ('127.0.0.1', 10002))
+                server.process_request(object(), ('127.0.0.2', 10003))
+                server.service_actions()
+            clock.return_value += f.OVERLOAD_LOG_INTERVAL
+            with self.assertLogs(f.LOG, level='WARNING') as logs:
+                server.service_actions()
+            self.assertIn(f'丢弃连接数=2 最近来源=127.0.0.2 并发上限={f.MAX_CONNECTIONS}', logs.output[0])
+            self.assertEqual(close.call_count, 3)
+
     def test_rotation(self):
         with tempfile.TemporaryDirectory() as d, patch.object(f,'ROOT',Path(d)):
             old_handlers=list(f.LOG.handlers); old_level=f.LOG.level

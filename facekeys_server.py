@@ -28,6 +28,11 @@ ACTION_ID = re.compile(r"[a-zA-Z0-9_-]{1,40}")
 DEFAULT_LOGGING = {"level": "INFO", "max_bytes": 2 * 1024 * 1024, "backup_count": 3}
 MAX_CONFIG = 256 * 1024
 MAX_BODY = 4096
+MAX_CONNECTIONS = 16
+OVERLOAD_LOG_INTERVAL = 30
+LOGGABLE_HTTP_METHODS = frozenset({
+    "GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH",
+})
 
 
 def starter_config():
@@ -319,7 +324,6 @@ class State:
             except ValueError:
                 return 503, {"status": "configuration_error"}
             if not secrets.compare_digest(token.encode("utf-8"), cfg["token"].encode("ascii")):
-                LOG.warning("[认证失败]")
                 return 403, {"status": "forbidden"}
             if method == "GET" and path == "/health":
                 return 200, {"status": "ok"}
@@ -395,8 +399,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def dispatch(self, method):
         try:
-            if len(self.path) > 128 or self.headers.get("Transfer-Encoding") is not None:
-                return self.reply(400, {"status": "invalid_request"})
+            if len(self.path) > 128:
+                return self.reply(400, {"status": "invalid_request"}, rejection_reason="path_too_long")
+            if self.headers.get("Transfer-Encoding") is not None:
+                return self.reply(400, {"status": "invalid_request"}, rejection_reason="unsupported_transfer_encoding")
             lengths = self.headers.get_all("Content-Length", [])
             if len(lengths) > 1 or (lengths and not re.fullmatch(r"[0-9]{1,8}", lengths[0])):
                 return self.reply(400, {"status": "invalid_length"})
@@ -412,7 +418,12 @@ class Handler(BaseHTTPRequestHandler):
         except (OSError, TimeoutError):
             LOG.debug("[HTTP] 连接中断或超时")
 
-    def reply(self, code, obj):
+    def reply(self, code, obj, *, rejection_reason=None):
+        status = obj.get("status") if obj is not None else None
+        if rejection_reason is None and status in ("invalid_length", "body_too_large", "forbidden", "not_found"):
+            rejection_reason = status
+        if rejection_reason is not None:
+            self.log_rejection(code, rejection_reason)
         body = b"" if obj is None else json.dumps(obj).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -423,7 +434,16 @@ class Handler(BaseHTTPRequestHandler):
         if body:
             self.wfile.write(body)
         self.close_connection = True
-        LOG.debug("[HTTP] %s %s %s", self.client_address[0], self.command, code)
+        LOG.debug("[HTTP] %s %s %s %s", self.client_address[0], self.command, code, status or "-")
+
+    def send_error(self, code, message=None, explain=None):
+        reason = "unsupported_method" if code == 501 else "http_parse_error"
+        self.log_rejection(code, reason)
+        super().send_error(code, message, explain)
+
+    def log_rejection(self, code, reason):
+        method = self.command if self.command in LOGGABLE_HTTP_METHODS else "-"
+        LOG.warning("[HTTP 拒绝] 来源=%s 方法=%s 状态=%s 原因=%s", self.client_address[0], method, code, reason)
 
     def log_message(self, fmt, *args):
         # Do not echo raw request paths or headers (may contain secrets).
@@ -438,7 +458,10 @@ class Server(ThreadingHTTPServer):
 
     def __init__(self, address, state):
         self.state = state
-        self.slots = threading.BoundedSemaphore(16)
+        self.slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        self.dropped_connections = 0
+        self.last_dropped_source = None
+        self.next_overload_log = float("-inf")
         super().__init__(address, Handler)
 
     def server_bind(self):
@@ -448,6 +471,8 @@ class Server(ThreadingHTTPServer):
 
     def process_request(self, request, address):
         if not self.slots.acquire(blocking=False):
+            self.dropped_connections += 1
+            self.last_dropped_source = address[0]
             self.shutdown_request(request)
             return
         try:
@@ -455,6 +480,20 @@ class Server(ThreadingHTTPServer):
         except BaseException:
             self.slots.release()
             raise
+
+    def service_actions(self):
+        # serve_forever runs this even when no further connections arrive.
+        if not self.dropped_connections:
+            return
+        now = time.monotonic()
+        if now < self.next_overload_log:
+            return
+        LOG.warning(
+            "[HTTP 过载] 丢弃连接数=%s 最近来源=%s 并发上限=%s",
+            self.dropped_connections, self.last_dropped_source, MAX_CONNECTIONS,
+        )
+        self.dropped_connections = 0
+        self.next_overload_log = now + OVERLOAD_LOG_INTERVAL
 
     def process_request_thread(self, request, address):
         try:
