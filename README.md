@@ -1,5 +1,11 @@
 # VN FaceKeys
 
+***More reading. Less clicking. No fapping. Literally, just blinking.***
+
+iPad 串流 VN 时用面部表情翻页，懒癌终末期患者的自救方案。
+
+-----
+
 **VN FaceKeys** 让你在 iPad 串流 Windows 视觉小说（Visual Novel，VN）时，通过眨眼、微笑等面部表情控制电脑的鼠标和键盘，实现免手阅读。
 
 它与 iPadOS 自带的头部追踪（Head Tracking）和快捷指令（Shortcuts）配合使用，支持自定义按键、组合键和宏，以及后台常驻和登录自动启动。
@@ -9,7 +15,7 @@ iPad 前置摄像头 → 头部追踪 → 快捷指令
                                 │ HTTP POST（局域网）
                                 ▼
                   VN FaceKeys → Windows 键盘 / 鼠标 → VN
-                  VoidLink    ← Windows 串流画面
+                   串流软件    ← Windows 串流画面
 ```
 
 | 面部表情 | 动作 ID | 默认操作 | VN 常见用途 |
@@ -36,7 +42,7 @@ iPad 前置摄像头 → 头部追踪 → 快捷指令
 
 ### 2.1 解压项目
 
-将项目解压至固定、可读写的目录，例如 `C:\VN FaceKeys`。打开 PowerShell，进入包含 `facekeys_server.py` 的目录：
+将项目解压或克隆至固定、可读写的目录，例如 `C:\VN FaceKeys`。打开 PowerShell，进入包含 `facekeys_server.py` 的目录：
 
 ```powershell
 cd 'C:\VN FaceKeys'
